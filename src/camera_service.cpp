@@ -18,7 +18,7 @@ namespace
 {
     volatile std::sig_atomic_t stop_requested = 0;
     
-    void hande_signal(int)
+    void handle_signal(int)
     {
         stop_requested = 1;
     }
@@ -92,7 +92,7 @@ namespace
 
     void handle_command(const cockpit::CommandMessage &command, bool &camera_enabled, bool &shutdown_requested)
     {
-        std::cout<<"Receieved command :"<<command_to_string(command.type)<<'\n';
+        std::cout<<"Received command :"<<command_to_string(command.type)<<'\n';
 
         switch(command.type)
         {
@@ -102,7 +102,7 @@ namespace
                 break;
             case cockpit::CommandType::STOP_CAMERA:
                 camera_enabled = false;
-                std::cout<<"camera state: STOOPED\n";
+                std::cout<<"camera state: STOPPED\n";
                 break;
             case cockpit::CommandType::SHUTDOWN:
                 shutdown_requested = true;
@@ -118,8 +118,8 @@ namespace
 
 int main()
 {
-    std::signal(SIGINT, hande_signal);
-    std::signal(SIGTERM, hande_signal);
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
     using namespace cockpit;
     
     int fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
@@ -221,7 +221,10 @@ int main()
             break;
         }
 
-        std::cout<<"Produced frame "<<frame_id<< '\n';
+        if(frame_id % FRAME_LOG_INTERVAL == 0)
+        {
+            std::cout<<"Produced frame "<<frame_id<<'\n';
+        }
         ++frame_id;
     }
     

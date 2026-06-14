@@ -17,15 +17,8 @@
 namespace
 {
     volatile std::sig_atomic_t stop_requested = 0;
-    uint64_t now_ns()
-    {
-        const auto now = std::chrono::steady_clock::now();
-        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 
-        return static_cast<uint64_t>(ns);
-    }
-
-    void hande_signal(int)
+    void handle_signal(int)
     {
         stop_requested = 1;
     }
@@ -101,7 +94,7 @@ namespace
 
         while(timeout.tv_nsec >= 1000*1000*1000)
         {
-            timeout.tv_nsec += 1;
+            timeout.tv_sec += 1;
             timeout.tv_nsec -= 1000 * 1000 * 1000;
         }
         
@@ -135,22 +128,16 @@ namespace
         }
     }
 
-    bool wait_for_semaphore(sem_t* semaphore, const char* semaphore_name)
+
+    uint64_t checksum_payload(const char* payload,std::size_t size)
     {
-        while(sem_wait(semaphore) == -1)
+        uint64_t checksum = 0;
+
+        for(std::size_t i{0}; i < size; i++)
         {
-            if(errno == EINTR)
-            {
-                if(stop_requested)
-                {
-                    return false;
-                }
-                continue;
-            }
-            std::cerr<<"sem_wait failed for "<<semaphore_name<<": "<<std::strerror(errno)<<'\n';
-            std::exit(EXIT_FAILURE);
+            checksum += static_cast<unsigned char>(payload[i]);
         }
-        return true;
+        return checksum;
     }
 }
 
@@ -158,8 +145,18 @@ int main()
 {
     using namespace cockpit;
 
-    std::signal(SIGINT, hande_signal);
-    std::signal(SIGTERM, hande_signal);
+    std::size_t benchmark_frame_received = 0;
+    std::size_t benchmark_byte_received = 0;
+    uint64_t benchmark_checksum = 0;
+
+    bool benchmark_started = false;
+    bool benchmark_printed = false;
+
+    std::chrono::steady_clock::time_point benchmark_start_time{};
+    std::chrono::steady_clock::time_point benchmark_end_time{};
+
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
     errno = 0;
     
     std::cout << "Display manager: starting ... \n";
@@ -243,8 +240,41 @@ int main()
         const uint64_t timestamp_ns = frame->timestamp_ns;
         const uint32_t payload_size = frame->payload_size;
 
-        std::cout<<"Display receieved frame "<<frame_id<<", timestamp_ns "<<timestamp_ns<<", payload_size = "<<payload_size<<'\n';
+        if(!benchmark_started)
+        {
+            benchmark_started = true;
+            benchmark_start_time = std::chrono::steady_clock::now();
+        }
 
+        if(ENABLE_PAYLOAD_CHECKSUM)
+        {
+            benchmark_checksum += checksum_payload(frame->payload,payload_size);
+        }
+
+        benchmark_frame_received++;
+        benchmark_byte_received += payload_size;
+
+        if(frame_id % FRAME_LOG_INTERVAL == 0)
+        {
+            std::cout<<"Display receieved frame "<<frame_id<<", timestamp_ns "<<timestamp_ns<<", payload_size = "<<payload_size<<'\n';
+        }
+
+        if(!benchmark_printed && benchmark_frame_received >= BENCHMARK_FRAME_COUNT)
+        {
+            benchmark_end_time = std::chrono::steady_clock::now();
+
+            const double elapsed_seconds = std::chrono::duration<double>(benchmark_end_time - benchmark_start_time).count();
+            const double throughput_MBps = static_cast<double>(benchmark_byte_received)/ elapsed_seconds / (1024.0 * 1024.0);
+
+            std::cout<<"\n ========Benchmark Results =============\n";
+            std::cout<<"frames received :"<<benchmark_frame_received<<'\n';
+            std::cout<<"payload size per frame:"<<payload_size<<"bytes \n";
+            std::cout<<"Total data received: "<< benchmark_byte_received <<"bytes \n";
+            std::cout<<"Elapsed time:"<<elapsed_seconds<<"seconds \n";
+            std::cout<<"Throughput:"<<throughput_MBps<<'\n';
+            std::cout<<"benchmark checksum:"<<benchmark_checksum<<'\n';
+            benchmark_printed = true;
+        }
         if(sem_post(buffer_empty) == -1)
         {
             std::cerr<<"sempost failed "<<std::strerror(errno)<<'\n';

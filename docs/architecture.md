@@ -1,6 +1,7 @@
 # Architecture Notes
 
-This document explains the design of the Cockpit IPC Communication Demo in more technical detail.
+Technical deep-dive into the design of the Cockpit IPC Communication Demo.  
+For setup and run instructions see the [README](../README.md).
 
 ---
 
@@ -21,15 +22,15 @@ This makes process boundaries explicit and demonstrates why IPC is needed when i
 
 ## 2. IPC Plane Separation
 
-The project separates communication into three planes.
+The project separates communication into three planes:
 
 ```text
-Data Plane            -> POSIX shared memory
-Synchronization Plane -> POSIX named semaphores
-Control Plane         -> POSIX message queues
+Data Plane            → POSIX shared memory
+Synchronization Plane → POSIX named semaphores
+Control Plane         → POSIX message queues
 ```
 
-This separation keeps each IPC mechanism focused on what it does best.
+This keeps each IPC mechanism focused on what it does best rather than routing everything through one channel.
 
 ---
 
@@ -41,15 +42,9 @@ Frame data is transferred through a named shared memory object:
 /cockpit_frame_buffer
 ```
 
-Both `camera_service` and `display_manager` map this object into their own virtual address spaces using `mmap()`.
+Both `camera_service` and `display_manager` map this object into their own virtual address spaces using `mmap()`. The processes do not share normal variables — they map the same OS-backed shared memory object independently.
 
-Important point:
-
-> The processes do not share normal variables. They map the same OS-backed shared memory object.
-
-The shared frame layout is defined in `include/common.hpp`.
-
-The frame buffer uses fixed-size fields and a fixed-size payload array. It intentionally avoids dynamic C++ containers such as `std::string`, `std::vector`, or pointers because those would refer to process-local heap memory and would not be valid across processes.
+The shared frame layout is defined in `include/common.hpp`. It uses fixed-size fields and a fixed-size payload array. Dynamic C++ containers such as `std::string`, `std::vector`, or raw pointers are intentionally avoided — those types store addresses into the process-local heap, which are meaningless when read from a different process's virtual address space.
 
 ---
 
@@ -58,18 +53,11 @@ The frame buffer uses fixed-size fields and a fixed-size payload array. It inten
 The project uses two named semaphores:
 
 ```text
-/cockpit_buffer_empty
-/cockpit_frame_ready
+/cockpit_buffer_empty    (initial value: 1)
+/cockpit_frame_ready     (initial value: 0)
 ```
 
-Initial values:
-
-```text
-buffer_empty = 1
-frame_ready  = 0
-```
-
-### Producer Flow
+### Producer Flow (camera_service)
 
 ```text
 wait(buffer_empty)
@@ -77,7 +65,7 @@ write complete frame into shared memory
 post(frame_ready)
 ```
 
-### Consumer Flow
+### Consumer Flow (display_manager)
 
 ```text
 wait(frame_ready)
@@ -85,24 +73,20 @@ read complete frame from shared memory
 post(buffer_empty)
 ```
 
-This prevents the camera from overwriting the shared frame buffer before the display has consumed the previous frame.
-
-A semaphore does not make a large frame write atomic by itself. It provides ordering and access coordination between producer and consumer.
+This prevents the camera from overwriting the shared frame buffer before the display has consumed the previous frame. Note that the semaphore does not make the frame write atomic — it provides ordering and mutual exclusion between producer and consumer.
 
 ---
 
 ## 5. Control Plane: POSIX Message Queues
 
-Runtime commands are sent using POSIX message queues.
-
-The project uses service-specific command queues:
+Runtime commands are sent using POSIX message queues:
 
 ```text
 /cockpit_camera_cmd_queue
 /cockpit_display_cmd_queue
 ```
 
-The HMI process sends small command messages such as:
+The HMI process sends small discrete commands:
 
 ```text
 START_CAMERA
@@ -110,107 +94,87 @@ STOP_CAMERA
 SHUTDOWN
 ```
 
-Commands are represented by a trivially-copyable `CommandMessage` structure. This is important because POSIX message queue APIs send and receive raw bytes.
+Commands are represented by a trivially-copyable `CommandMessage` struct. This is required because POSIX message queue APIs transfer raw bytes — non-trivial types with vtables or heap pointers cannot be safely sent this way.
 
 ---
 
-## 6. Why Not Use One Shared Command Queue?
+## 6. Why Not One Shared Command Queue?
 
-A POSIX message queue is not a broadcast mechanism.
+POSIX message queues are not broadcast channels. Each message is consumed by exactly one receiver. If camera and display both read from the same queue, a single `SHUTDOWN` message reaches one service only — the other never sees it.
 
-If camera and display both read from the same queue, each message is consumed by only one receiver. That means a single `SHUTDOWN` command might reach camera but not display, or display but not camera.
-
-To avoid this ambiguity, the design uses separate queues:
+The design uses separate queues to give explicit, reliable command routing:
 
 ```text
-hmi_service -> /cockpit_camera_cmd_queue  -> camera_service
-hmi_service -> /cockpit_display_cmd_queue -> display_manager
+hmi_service → /cockpit_camera_cmd_queue  → camera_service
+hmi_service → /cockpit_display_cmd_queue → display_manager
 ```
-
-This gives explicit command routing and enables coordinated shutdown.
 
 ---
 
 ## 7. Runtime State Model
 
-### Camera Service
-
-The camera has two main runtime states:
+### camera_service
 
 ```text
-STOPPED
-RUNNING
-```
+States:      STOPPED, RUNNING
 
-Transitions:
-
-```text
-STOPPED --START_CAMERA--> RUNNING
-RUNNING --STOP_CAMERA---> STOPPED
+STOPPED  --START_CAMERA-->  RUNNING
+RUNNING  --STOP_CAMERA--->  STOPPED
 RUNNING/STOPPED --SHUTDOWN--> EXIT
 ```
 
-The camera uses non-blocking message queue receive so it can check commands while continuing to produce frames when enabled.
+The camera uses non-blocking message queue receive (`O_NONBLOCK`) so it can poll for commands while continuing to produce frames when enabled.
 
-### Display Manager
+### display_manager
 
-The display manager consumes frames and also listens for shutdown commands.
+The display manager consumes frames and listens for shutdown commands.
 
-A plain blocking `sem_wait(frame_ready)` would be unsafe for shutdown because display could block forever if the camera stopped producing frames.
-
-Therefore, display uses a timed wait pattern:
+A plain blocking `sem_wait(frame_ready)` would be unsafe for shutdown — display would block indefinitely if the camera stopped producing frames. Instead, display uses a timed wait pattern:
 
 ```text
-wait briefly for frame
-if frame received -> consume frame
-if timeout -> check command queue
-if shutdown command -> exit
+wait up to 100ms for frame_ready
+if frame received  → consume frame
+if timeout         → poll command queue
+if SHUTDOWN seen   → exit
 ```
 
-This lets display respond to shutdown even when no frames are arriving.
+This allows display to respond to shutdown even when no frames are arriving.
 
 ---
 
 ## 8. Cleanup Ownership
 
-Services close their own local handles:
+Each service closes its own local handles on exit:
 
 ```text
-mq_close
-sem_close
-munmap
-close
+mq_close / sem_close / munmap / close
 ```
 
-The `cleanup_ipc` utility owns unlinking named IPC objects:
+`cleanup_ipc` owns unlinking the named IPC objects:
 
 ```text
-shm_unlink
-sem_unlink
-mq_unlink
+shm_unlink  → /cockpit_frame_buffer
+sem_unlink  → /cockpit_buffer_empty, /cockpit_frame_ready
+mq_unlink   → /cockpit_camera_cmd_queue, /cockpit_display_cmd_queue
 ```
 
-This centralizes cleanup and avoids each service unexpectedly deleting IPC objects while another service may still be using them.
+Centralizing unlink in one utility prevents a service from removing an IPC object while another service still holds it open.
 
 ---
 
 ## 9. Failure Modes Considered
 
-### Stale IPC Objects
+**Stale IPC objects**  
+Named POSIX IPC objects persist after crashes or forced termination. Running `cleanup_ipc` before each test run removes them and avoids stale-state issues.
 
-Named POSIX IPC objects can remain after crashes or forced termination. `cleanup_ipc` removes stale objects before fresh test runs.
+**Stale message queue attributes**  
+If a queue was previously created with a different `mq_msgsize`, subsequent `mq_open` with `O_CREAT` may silently reuse the old queue with the old size, causing `mq_send` / `mq_receive` to fail. `cleanup_ipc` unlinks queues to prevent this.
 
-### Display Blocking Forever
+**Display blocking forever**  
+Solved by replacing the infinite `sem_wait` with a 100ms `sem_timedwait` in `display_manager`, allowing periodic command queue polling.
 
-Solved by replacing an infinite semaphore wait with a timed wait in `display_manager`.
-
-### Message Queue Not Existing
-
-The HMI expects camera and display services to be started first because they create their command queues.
-
-### Stale Message Queue Attributes
-
-If a message queue was created earlier with a different message size, `mq_send()` or `mq_receive()` may fail with message-size errors. Running `cleanup_ipc` before testing avoids this.
+**HMI started before services**  
+The HMI opens queues with `O_WRONLY` (no `O_CREAT`). If camera or display have not started yet their queues do not exist and `mq_open` will fail. Start camera and display before HMI.
 
 ---
 
@@ -218,28 +182,22 @@ If a message queue was created earlier with a different message size, `mq_send()
 
 ### Demo Correctness
 
-The current project demonstrates the intended IPC architecture and runtime command flow.
+The project demonstrates the intended IPC architecture and runtime command flow correctly.
 
 ### Benchmark Correctness
 
-Throughput should be measured separately using controlled conditions:
-
-- fixed frame count
-- fixed payload size
-- Release build
-- reduced logging
-- payload touched or checksummed by consumer
+The throughput result (~6.3 GB/s, Release build, 1MB frames, checksum enabled) reflects a controlled back-to-back producer-consumer run on a single machine. Numbers vary with CPU, memory bandwidth, cache behavior, payload size, and synchronization overhead. Benchmarks should be run on a Release build with reduced logging and a clean IPC state.
 
 ### Production Robustness
 
-A production system would need additional features:
+A production cockpit system would additionally require:
 
-- supervisor process
-- stronger error recovery
-- protocol versioning
-- permissions/security hardening
-- resource ownership strategy
-- health monitoring
-- watchdog integration
+- Supervisor process with automatic service restart
+- Watchdog integration
+- Protocol versioning for `CommandMessage` and `FrameBuffer`
+- Permission and security hardening on IPC objects
+- Health monitoring
+- Defined resource ownership and lifecycle strategy
+- Recovery from unexpected process termination
 
-This project does not claim to be production-ready. It is a focused Linux IPC learning/demo project.
+This project does not claim production readiness. It is a focused Linux IPC learning and portfolio project.

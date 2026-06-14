@@ -10,11 +10,14 @@ namespace cockpit
     constexpr const char *SEM_FRAME_READY = "/cockpit_frame_ready";
 
     constexpr const char* CAMERA_COMMAND_QUEUE_NAME = "/cockpit_camera_cmd_queue";
-    constexpr const char* DISPLAY_COMMAND_QUEUE_NAME = "/cockpit_dispaly_cmd_queue";
+    constexpr const char* DISPLAY_COMMAND_QUEUE_NAME = "/cockpit_display_cmd_queue";
     constexpr long COMMAND_QUEUE_MESSAGES = 10;
 
-    constexpr std::size_t FRAME_PAYLOAD_SIZE = 2048*2048;
-    constexpr int FRAME_COUNT = 1000;
+    constexpr int BENCHMARK_FRAME_COUNT = 1000;
+    constexpr bool ENABLE_PAYLOAD_CHECKSUM = true;
+    constexpr int FRAME_LOG_INTERVAL = 100;
+
+    constexpr std::size_t FRAME_PAYLOAD_SIZE = 1024 * 1024;
 
     struct FrameBuffer
     {

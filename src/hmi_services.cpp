@@ -52,7 +52,7 @@ namespace
     {
         std::cout<<"\n HMI Service \n";
         std::cout<<"1. Start camera \n";
-        std::cout<<"2. Stop cameara \n";
+        std::cout<<"2. Stop camera \n";
         std::cout<<"3. Shutdown System \n";
         std::cout<<"q. Quit HMI only \n";
         std::cout<<"Enter choice: ";
